@@ -1,0 +1,2 @@
+# Execl_score
+使用GAS加上Google的Excel做的簡易評分系統
