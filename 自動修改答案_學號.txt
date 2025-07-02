@@ -1,0 +1,438 @@
+// 全域變數
+var TimeUnit = 4; // 4 分鐘為單位
+var TimeDelay = 1; // 每慢 1 個 TimeUnit 減少 1 個百分點
+var SOURCE_SHEET_NAME = "表單回應 11"; // 來源工作表名稱
+var TARGET_SHEET_NAME = "Fraction";   // 目標工作表名稱
+
+function calculateScoresWithFormulas() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(SOURCE_SHEET_NAME);
+  var targetSheet = ss.getSheetByName(TARGET_SHEET_NAME);
+
+  if (!sheet || !targetSheet) {
+    Logger.log("工作表找不到，請檢查名稱");
+    return;
+  }
+  
+  var data = sheet.getDataRange().getValues();
+  var lastRow = sheet.getLastRow();
+  
+  var m = data[1][0]; // A2
+  var n = data[1][1]; // B2
+  
+  // 假設學號在 B 欄（第 2 欄，索引 1）
+  var studentIdColumnIndex = 1; // B 欄固定為學號
+
+  // 動態檢測正確答案的實際行數
+  var actualAnswerRows = 0;
+  for (var i = 1; i <= m; i++) {
+    var row = data[i]; // 從第 2 行開始檢查
+    var hasAnswer = false;
+    for (var col = 3; col < 3 + n; col++) { // 檢查 D 到 D+n-1 欄
+      if (row[col] && row[col].toString().trim() !== "") {
+        hasAnswer = true;
+        break;
+      }
+    }
+    if (hasAnswer) {
+      actualAnswerRows++;
+    } else {
+      break; // 如果遇到空行，假設正確答案結束
+    }
+  }
+
+  if (actualAnswerRows === 0) {
+    Logger.log("未找到正確答案，無法繼續");
+    return;
+  }
+
+  // 清除目標工作表的舊資料
+  var maxColumns = targetSheet.getMaxColumns();
+  if (maxColumns >= 5) {
+    var columnsToClear = maxColumns - 4;
+    targetSheet.getRange(1, 5, targetSheet.getMaxRows(), columnsToClear).clearContent();
+  }
+  
+  var headers = ["時間戳記", "學號", "答對總題數", "時間比率"];
+  for (var j = 0; j < n; j++) {
+    headers.push("第" + (j + 1) + "題");
+  }
+ 
+  targetSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  
+  // 使用學號判斷最新提交
+  var studentLatestRowMap = {};
+  var firstSubmitRow = null;
+  var startRowIndex = 1 + m; // 用於遍歷學生資料
+
+  for (var i = startRowIndex; i < data.length; i++) {
+    var timestamp = data[i][0]; // 時間戳記
+    var studentId = data[i][studentIdColumnIndex]; // B 欄學號
+    
+    if (!timestamp) {
+      Logger.log("Row " + (i + 1) + " has no timestamp, skipping...");
+      continue;
+    }
+    
+    // 檢查該行是否有效（至少有一個答案欄位不為空）
+    var hasAnswer = false;
+    for (var col = 3; col < 3 + n; col++) {
+      if (data[i][col] && data[i][col].toString().trim() !== "") {
+        hasAnswer = true;
+        break;
+      }
+    }
+    
+    if (!studentId || studentId.toString().trim() === "") {
+      continue; // 跳過空的學號，不記錄日誌
+    }
+    
+    var key = studentId.toString().trim(); // 使用學號作為唯一標識
+    
+    if (firstSubmitRow === null || timestamp < data[firstSubmitRow - 1][0]) {
+      firstSubmitRow = i + 1;
+    }
+    
+    if (!(key in studentLatestRowMap) || timestamp > data[studentLatestRowMap[key]][0]) {
+      studentLatestRowMap[key] = i;
+    }
+  }
+  
+  var validRows = Object.values(studentLatestRowMap);
+
+  // 將時間戳記和學號寫入目標工作表
+  var targetRowIndex = 2;
+  for (var i = 0; i < validRows.length; i++) {
+    var sourceRow = validRows[i] + 1;
+    sheet.getRange(sourceRow, 1, 1, 1)
+         .copyTo(targetSheet.getRange(targetRowIndex, 1), {contentsOnly: true});
+    var studentId = data[validRows[i]][studentIdColumnIndex].toString().trim();
+    targetSheet.getRange(targetRowIndex, 2, 1, 1).setValue(studentId);
+    targetRowIndex++;
+  }
+  
+  // 使用實際的正確答案行數
+  var correctAnswersRange = sheet.getRange(2, 4, actualAnswerRows, n); // D2 開始，actualAnswerRows 行 n 欄
+  var correctAnswersValues = correctAnswersRange.getValues();
+  var processedCorrectAnswerCells = [];
+  
+  for (var j = 0; j < n; j++) {
+    var answerCellsForQuestion = [];
+    for (var i = 0; i < actualAnswerRows; i++) {
+      var answer = correctAnswersValues[i][j];
+      if (answer && answer.toString().trim() !== "") {
+        var colLetter = getColumnLetter(3 + j); // 使用新函數生成正確的欄位字母
+        var rowNum = 2 + i;
+        var cellAddress = "'" + SOURCE_SHEET_NAME + "'!" + colLetter + rowNum;
+        answerCellsForQuestion.push(cellAddress);
+      }
+    }
+    processedCorrectAnswerCells.push(answerCellsForQuestion);
+  }
+  
+  var scoreFormulas = [];
+  var ratioFormulas = [];
+  var questionResults = [];
+  var firstSubmitCell = "'" + SOURCE_SHEET_NAME + "'!A" + firstSubmitRow;
+  
+  for (var i = 0; i < validRows.length; i++) {
+    var rowNum = validRows[i] + 1;
+    var targetRow = i + 2;
+    
+    var firstQuestionColLetter = getColumnLetter(4); // E 欄 (第 5 欄)
+    var lastQuestionColLetter = getColumnLetter(4 + n - 1); // 最後一題的欄位
+    var scoreFormula = "=SUM(" + firstQuestionColLetter + targetRow + ":" + lastQuestionColLetter + targetRow + ")";
+    scoreFormulas.push([scoreFormula]);
+    
+    var questionRowResults = [];
+    for (var j = 0; j < n; j++) {
+      var questionCol = getColumnLetter(3 + j); // 從 D 開始的欄位
+      var studentAnswer = "'" + SOURCE_SHEET_NAME + "'!" + questionCol + rowNum;
+      
+      var correctAnswerCells = processedCorrectAnswerCells[j];
+      
+      if (correctAnswerCells.length === 0) {
+        var questionFormula = "0";
+      } else {
+        var orConditions = correctAnswerCells
+          .map(cell => "TRIM(LOWER(" + studentAnswer + "))=TRIM(LOWER(" + cell + "))")
+          .join(",");
+        var questionFormula = "IF(AND(" + studentAnswer + "<>\"\",OR(" + orConditions + ")),1,0)";
+      }
+      
+      questionRowResults.push(questionFormula);
+    }
+    
+    var timeDiff = "(A" + targetRow + "-" + firstSubmitCell + ")*1440";
+    var ratioFormula = "=MAX(0, 100-" + TimeDelay + "*" + timeDiff + "/" + TimeUnit + ")";
+    ratioFormulas.push([ratioFormula]);
+    
+    questionResults.push(questionRowResults);
+  }
+  
+  if (scoreFormulas.length > 0) {
+    targetSheet.getRange(2, 3, scoreFormulas.length, 1).setFormulas(scoreFormulas);
+    targetSheet.getRange(2, 4, ratioFormulas.length, 1).setFormulas(ratioFormulas);
+    targetSheet.getRange(2, 4, ratioFormulas.length, 1).setNumberFormat("0.00");
+    targetSheet.getRange(2, 5, questionResults.length, n).setFormulas(questionResults);
+  }
+}
+
+// 輔助函數：將欄位索引轉換為 Excel 欄位名稱（如 0 -> A，26 -> AA）
+function getColumnLetter(columnNumber) {
+  let dividend = columnNumber;
+  let columnName = '';
+  while (dividend >= 0) {
+    let modulo = (dividend % 26);
+    columnName = String.fromCharCode(65 + modulo) + columnName;
+    dividend = Math.floor(dividend / 26) - 1;
+    if (dividend < 0) break;
+  }
+  return columnName;
+}
+
+function onFormSubmit(e) {
+  calculateScoresWithFormulas();
+}
+
+
+function writeStudentIdFormulas() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(SOURCE_SHEET_NAME);
+
+  if (!sheet) {
+    Logger.log("找不到來源工作表");
+    return;
+  }
+
+  var data = sheet.getDataRange().getValues();
+  var lastRow = sheet.getLastRow();
+  var lastColumn = sheet.getLastColumn();
+
+  var m = data[1][0]; // A2
+  var n = data[1][1]; // B2
+
+  // 動態尋找 Email 欄位
+  var emailColumnIndex = -1;
+
+  // 先檢查標頭行是否有「電子郵件」相關關鍵詞
+  var headers = data[0]; // 第 1 行（標頭）
+  for (var col = 0; col < headers.length; col++) {
+    var header = headers[col];
+    if (header && typeof header === "string" && header.includes("電子郵件")) {
+      emailColumnIndex = col;
+      break;
+    }
+  }
+
+  // 如果標頭找不到，則遍歷資料行尋找 Email
+  if (emailColumnIndex === -1) {
+    for (var i = 1; i < data.length; i++) {
+      var row = data[i];
+      var hasTimestamp = row[0] && row[0] instanceof Date;
+      var hasAnswer = false;
+      for (var col = 3; col < 3 + n; col++) {
+        if (row[col] && row[col].toString().trim() !== "") {
+          hasAnswer = true;
+          break;
+        }
+      }
+      if (hasTimestamp && hasAnswer) {
+        for (var col = 0; col < lastColumn; col++) {
+          var cellValue = row[col];
+          if (cellValue && typeof cellValue === "string" && cellValue.includes("@")) {
+            emailColumnIndex = col;
+            break;
+          }
+        }
+      }
+      if (emailColumnIndex !== -1) break;
+    }
+  }
+
+  if (emailColumnIndex === -1) {
+    Logger.log("未找到 Email 欄位");
+    return;
+  }
+
+  // 將 Email 欄位索引轉換為字母（例如 K）
+  var column = emailColumnIndex + 1;
+  var temp, letter = '';
+  while (column > 0) {
+    temp = (column - 1) % 26;
+    letter = String.fromCharCode(temp + 65) + letter;
+    column = (column - temp - 1) / 26;
+  }
+  var emailColLetter = letter;
+
+  Logger.log("Email 欄位字母: " + emailColLetter);
+
+  // 收集需要更新的行和公式（僅對 B 欄為空的行）
+  var formulasForSource = [];
+  var rowsToUpdate = [];
+  var startRowIndex = 2; // 從第 3 行（data[2]）開始，因為第 2 行是答案
+
+  for (var i = startRowIndex; i < data.length; i++) {
+    var rowNum = i + 1;
+    var email = data[i][emailColumnIndex]; // Email
+    var currentValue = data[i][1]; // B 欄的當前顯示值
+
+    // 檢查 B 欄是否為空且有 Email
+    if (!currentValue || currentValue.toString().trim() === "") {
+      if (email && email.toString().trim() !== "") {
+        var emailCell = `${emailColLetter}${rowNum}`;
+        var formula = `=LEFT(${emailCell}, 8)`;
+        formulasForSource.push([formula]);
+        rowsToUpdate.push(rowNum);
+      }
+    }
+  }
+
+  // 根據需要更新的行，動態寫入公式
+  if (rowsToUpdate.length > 0) {
+    // 按連續範圍分組寫入
+    var currentStartRow = rowsToUpdate[0];
+    var currentFormulas = [];
+    var updatedRows = 0;
+
+    for (var i = 0; i < rowsToUpdate.length; i++) {
+      var rowNum = rowsToUpdate[i];
+      if (i === 0 || rowNum === rowsToUpdate[i - 1] + 1) {
+        // 連續範圍，繼續添加
+        currentFormulas.push(formulasForSource[i]);
+      } else {
+        // 範圍斷開，寫入前一段
+        sheet.getRange(currentStartRow, 2, currentFormulas.length, 1).setFormulas(currentFormulas);
+        updatedRows += currentFormulas.length;
+        // 開始新範圍
+        currentStartRow = rowNum;
+        currentFormulas = [formulasForSource[i]];
+      }
+    }
+
+    // 寫入最後一段範圍
+    if (currentFormulas.length > 0) {
+      sheet.getRange(currentStartRow, 2, currentFormulas.length, 1).setFormulas(currentFormulas);
+      updatedRows += currentFormulas.length;
+    }
+
+    Logger.log("學號已寫入來源表（表單回應 11）B欄，僅更新空值行，共更新 " + updatedRows + " 行");
+  } else {
+    Logger.log("沒有需要更新的空值行");
+  }
+}
+
+function clearanswer() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var targetSheet = ss.getSheetByName(TARGET_SHEET_NAME);
+
+  if (!targetSheet) {
+    Logger.log("工作表 '" + TARGET_SHEET_NAME + "' 找不到，請檢查名稱");
+    return;
+  }
+  
+  var lastRow = targetSheet.getLastRow();
+  var lastColumn = targetSheet.getLastColumn();
+  var maxColumns = targetSheet.getMaxColumns();
+  
+  if (lastRow > 1) {
+    targetSheet.getRange(2, 1, lastRow - 1, lastColumn).clearContent();
+    Logger.log("已清除 " + TARGET_SHEET_NAME + " 工作表中從第 2 行開始的所有計算結果");
+  } else {
+    Logger.log(TARGET_SHEET_NAME + " 工作表中無數據可清除");
+  }
+
+  if (maxColumns >= 5) {
+    var columnsToClear = maxColumns - 4;
+    targetSheet.getRange(1, 5, targetSheet.getMaxRows(), columnsToClear).clearContent();
+    Logger.log("已清除 " + TARGET_SHEET_NAME + " 工作表中從 E 欄開始的答題結果");
+  } else {
+    Logger.log(TARGET_SHEET_NAME + " 工作表中無答題結果欄位（E 欄及之後），無需清除");
+  }
+}
+
+function clearyouranswer() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(SOURCE_SHEET_NAME);
+
+  if (!sheet) {
+    Logger.log("工作表 '" + SOURCE_SHEET_NAME + "' 找不到，請檢查名稱");
+    return;
+  }
+  
+  var data = sheet.getDataRange().getValues();
+  var lastRow = sheet.getLastRow();
+  
+  var m = data[1][0]; // A2
+  var startRow = m + 2; // 學生資料的起始行
+  var numRows = lastRow - startRow + 1; // 需要清除的行數
+  
+  if (numRows > 0) {
+    // 清除資料
+    sheet.getRange(startRow, 1, numRows, sheet.getLastColumn()).clearContent();
+    // 刪除這些空白行
+    sheet.deleteRows(startRow, numRows);
+    Logger.log("startRow: " + startRow + ", numRows: " + numRows);
+    Logger.log("已清除並刪除藍底數據，共 " + numRows + " 行");
+  } else {
+    Logger.log("無學生回答數據，無法清除藍底數據");
+  }
+}
+
+const LINE_TOKEN = 'JLIJN7SOMmKSZS+PbU3ZG4C5LMfKp7ctiuOEv8RiNa3yZsS5rpxGEz7UwOUL4BH9lk9bRD1xX2tlsG3l4F2eHcPnhvRi9Q40xOb0eI0FuaNBswW0cgtnXtLa+7DHBxzqI4To7eCQdTZvckgKrEpHWgdB04t89/1O/w1cDnyilFU=';  //微積分 ⬅️ 替換成你自己的
+// const LINE_TOKEN = 'eJ7bGhAxt8hWjSCl5YpzVxDslKVs5mLdHDWON5cu3BRWNk8vIOVr+90GAzGZFKIOUVv49k21y9FYEFw2Gv5mfenAgf7OWHPARM5dY341u9dbj4mLwqgdnQe7cAEH0oFOgAXHocuopkp34xixdYyWZQdB04t89/1O/w1cDnyilFU=';  //數位邏輯 
+const GROUP_ID = 'C37398c6bcf96f7370607344368325d57';      //微積分 ⬅️ 使用你剛剛取得的 groupId
+// const GROUP_ID = 'C5eaf80aee2a5e95f5d675e9be9d29d96';   //數位邏輯
+const CACHE_KEY = 'first_student_submitted';
+
+function onFormSubmit_LINEnotify(e) {
+  const cache = CacheService.getScriptCache();
+  const isStudentSubmitted = cache.get(CACHE_KEY);
+  if (isStudentSubmitted) return;
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('表單回應 11');
+  const values = e.values;                     // 這次提交的所有欄位值
+  const email = values[values.length - 1];     // ✅ 這次提交的「最後一個欄位」，作為 Email
+  //const name = sheet.getRange(lastRow, 2).getValue();   // 假設第2欄是「姓名」
+
+  const studentIdCandidate = email.substring(0, 8);
+  //const isStudent = /^[A-Za-z]{1}\d{7}$/.test(studentIdCandidate);
+  const isStudent = 'true';
+  if (isStudent) {
+    const message = `已經有人交卷囉，大家請把握時間！`;
+    sendLineMessageToGroup(message);
+    cache.put(CACHE_KEY, 'true', 10800); // 1 小時有效，可自行調整
+  }
+}
+
+function sendLineMessageToGroup(text) {
+  const url = 'https://api.line.me/v2/bot/message/push';
+  const payload = {
+    to: GROUP_ID,
+    messages: [{
+      type: 'text',
+      text: text
+    }]
+  };
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      Authorization: 'Bearer ' + LINE_TOKEN
+    },
+    payload: JSON.stringify(payload)
+  };
+
+  UrlFetchApp.fetch(url, options);
+}
+
+// ✅ 手動清除 Cache 用
+function clearStudentCache() {
+  const cache = CacheService.getScriptCache();
+  cache.remove(CACHE_KEY);
+  Logger.log('✅ 已清除通知記錄，可以重新觸發交卷通知。');
+}
+
+
+//以下是TSETEST
